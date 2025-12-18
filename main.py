@@ -43,9 +43,25 @@ class CVEBot(discord.Client):
         super().__init__(*args, **kwargs)
         self.bg_task = None
         self.web_server = None
+        self.health_monitor_task = None
+        self.error_count = 0
+        self.last_successful_check = datetime.now(timezone.utc)
 
     async def on_ready(self):
         logger.info(f'Bot conectado como {self.user} (ID: {self.user.id})')
+        
+        # Envia mensagem de inicialização
+        channel = self.get_channel(CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="🟢 Bot Online",
+                description=f"Bot iniciado com sucesso às {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Status", value="✅ Operacional", inline=True)
+            embed.add_field(name="Monitoramento", value="Ativo (10 min)", inline=True)
+            await channel.send(embed=embed)
+        
         # Inicia a tarefa de monitoramento se ainda não estiver rodando
         if self.bg_task is None:
             self.bg_task = self.loop.create_task(self.monitor_cves_task())
@@ -55,6 +71,11 @@ class CVEBot(discord.Client):
         if self.web_server is None:
             self.web_server = self.loop.create_task(self.start_health_server())
             logger.info("Servidor HTTP de health check iniciado.")
+        
+        # Inicia monitoramento de saúde
+        if self.health_monitor_task is None:
+            self.health_monitor_task = self.loop.create_task(self.health_monitor())
+            logger.info("Monitor de saúde iniciado.")
 
     async def monitor_cves_task(self):
         """Loop principal de monitoramento."""
@@ -87,13 +108,27 @@ class CVEBot(discord.Client):
                             await asyncio.sleep(2)
                         except Exception as e_send:
                             logger.error(f"Erro ao enviar CVE {cve.get('cve', {}).get('id', 'unknown')}: {e_send}")
+                            self.error_count += 1
                             # Continua para o próximo item mesmo se este falhar
                             continue
                 else:
                     logger.info("Nenhuma nova CVE encontrada neste ciclo.")
+                
+                # Reset error count e atualiza último sucesso
+                self.error_count = 0
+                self.last_successful_check = datetime.now(timezone.utc)
 
             except Exception as e:
                 logger.error(f"Erro no loop de monitoramento: {e}")
+                self.error_count += 1
+                
+                # Se tiver muitos erros seguidos, envia alerta
+                if self.error_count >= 3:
+                    await self.send_health_alert(
+                        "⚠️ Alerta: Erros Consecutivos",
+                        f"O bot encontrou {self.error_count} erros consecutivos ao buscar CVEs.",
+                        discord.Color.orange()
+                    )
             
             # Aguarda 10 minutos antes da próxima verificação
             await asyncio.sleep(600)
@@ -260,16 +295,69 @@ class CVEBot(discord.Client):
         
         return embed
 
+    async def health_monitor(self):
+        """Monitora a saúde do bot e envia alertas se necessário."""
+        await self.wait_until_ready()
+        await asyncio.sleep(60)  # Aguarda 1 minuto antes de começar a monitorar
+        
+        while not self.is_closed():
+            try:
+                # Verifica tempo desde última verificação bem-sucedida
+                time_since_last = datetime.now(timezone.utc) - self.last_successful_check
+                
+                # Se passou mais de 20 minutos sem sucesso, envia alerta
+                if time_since_last.total_seconds() > 1200:  # 20 minutos
+                    await self.send_health_alert(
+                        "🔴 Alerta Crítico: Sistema Inativo",
+                        f"O bot não consegue verificar CVEs há {int(time_since_last.total_seconds() / 60)} minutos.",
+                        discord.Color.red()
+                    )
+                    # Aguarda 1 hora antes de enviar outro alerta crítico
+                    await asyncio.sleep(3600)
+                
+            except Exception as e:
+                logger.error(f"Erro no monitor de saúde: {e}")
+            
+            # Verifica a cada 5 minutos
+            await asyncio.sleep(300)
+    
+    async def send_health_alert(self, title, description, color):
+        """Envia um alerta de saúde para o canal."""
+        try:
+            channel = self.get_channel(CHANNEL_ID)
+            if channel:
+                embed = discord.Embed(
+                    title=title,
+                    description=description,
+                    color=color,
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(name="Última verificação bem-sucedida", 
+                               value=self.last_successful_check.strftime('%Y-%m-%d %H:%M:%S UTC'))
+                embed.add_field(name="Erros consecutivos", value=str(self.error_count))
+                embed.set_footer(text="Brazukas Hacking Club • Sistema de Monitoramento")
+                await channel.send(embed=embed)
+                logger.info(f"Alerta de saúde enviado: {title}")
+        except Exception as e:
+            logger.error(f"Erro ao enviar alerta de saúde: {e}")
+
     async def start_health_server(self):
         """Inicia um servidor HTTP simples para health check do DigitalOcean."""
         async def health_check(request):
+            # Verifica se o bot está saudável
+            time_since_last = datetime.now(timezone.utc) - self.last_successful_check
+            if time_since_last.total_seconds() > 1200:  # 20 minutos
+                return web.Response(text="UNHEALTHY", status=503)
             return web.Response(text="OK", status=200)
         
         async def root_handler(request):
-            return web.Response(
-                text="NIST Discord Bot - Brazukas Hacking Club\nStatus: Running",
-                status=200
-            )
+            uptime = datetime.now(timezone.utc) - self.last_successful_check
+            status_info = f"""NIST Discord Bot - Brazukas Hacking Club
+Status: {'🟢 Healthy' if uptime.total_seconds() < 1200 else '🔴 Unhealthy'}
+Last Check: {self.last_successful_check.strftime('%Y-%m-%d %H:%M:%S UTC')}
+Errors: {self.error_count}
+Bot User: {self.user.name if self.user else 'Not connected'}"""
+            return web.Response(text=status_info, status=200)
         
         app = web.Application()
         app.router.add_get('/', root_handler)
